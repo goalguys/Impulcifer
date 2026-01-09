@@ -11,7 +11,6 @@ All defaults are embedded in Config below. You can still override via CLI flags.
 
 import argparse
 import json
-import math
 import os
 import time
 from dataclasses import dataclass, asdict
@@ -23,6 +22,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+
+try:
+    from sklearn.metrics import average_precision_score
+    _HAS_SK = True
+except Exception:
+    _HAS_SK = False
 
 
 @dataclass
@@ -193,6 +198,41 @@ def smoothness_loss(prob: torch.Tensor) -> torch.Tensor:
         return torch.tensor(0.0, device=prob.device)
     dp = torch.abs(prob[:, 1:] - prob[:, :-1])
     return dp.mean()
+
+
+def pr_curve_by_threshold(y_true: np.ndarray, y_prob: np.ndarray, bins: int = 101) -> Dict[str, np.ndarray]:
+    thresholds = np.linspace(0.0, 1.0, int(bins), dtype=np.float64)
+    y_true = y_true.astype(np.int32)
+    y_prob = y_prob.astype(np.float64)
+
+    prec = np.zeros_like(thresholds, dtype=np.float64)
+    rec = np.zeros_like(thresholds, dtype=np.float64)
+    fpr = np.zeros_like(thresholds, dtype=np.float64)
+
+    pos = (y_true == 1)
+    neg = ~pos
+    eps = 1e-12
+
+    for i, thr in enumerate(thresholds):
+        pred = (y_prob >= thr)
+        tp = float(np.logical_and(pred, pos).sum())
+        fp = float(np.logical_and(pred, neg).sum())
+        fn = float(np.logical_and(~pred, pos).sum())
+        tn = float(np.logical_and(~pred, neg).sum())
+        prec[i] = tp / (tp + fp + eps)
+        rec[i] = tp / (tp + fn + eps)
+        fpr[i] = fp / (fp + tn + eps)
+
+    return {"thr": thresholds, "precision": prec, "recall": rec, "fpr": fpr}
+
+
+def save_pr_curve(out_dir: str, epoch: int, curves: Dict[str, np.ndarray]) -> None:
+    ensure_dir(out_dir)
+    csv_path = os.path.join(out_dir, f"pr_threshold_epoch{epoch:03d}.csv")
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("thr,precision,recall,fpr\n")
+        for t, p, r, fp in zip(curves["thr"], curves["precision"], curves["recall"], curves["fpr"]):
+            f.write(f"{t:.6f},{p:.6f},{r:.6f},{fp:.6f}\n")
 
 
 # -----------------------------
@@ -398,10 +438,20 @@ class Cnn14Frame(nn.Module):
 # -----------------------------
 
 @torch.no_grad()
-def evaluate(model: nn.Module, mel: LogMel, dl, cfg: Config, device: torch.device) -> Dict[str, float]:
+def evaluate(
+    model: nn.Module,
+    mel: LogMel,
+    dl,
+    cfg: Config,
+    device: torch.device,
+    epoch: int,
+    out_dir: str,
+) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
     total_frames = 0.0
+    all_y: List[np.ndarray] = []
+    all_p: List[np.ndarray] = []
 
     for ref, rec, noisy, starts in dl:
         ref = ref.to(device)
@@ -418,11 +468,34 @@ def evaluate(model: nn.Module, mel: LogMel, dl, cfg: Config, device: torch.devic
         T = logits.size(1)
         y = intervals_to_frame_labels_batch(noisy, starts, T, cfg.hop * 64, cfg.sr, cfg.label_expand_ms, device)
         loss = focal_bce_with_logits(logits, y, cfg.focal_alpha, cfg.focal_gamma)
+        prob = torch.sigmoid(logits)
+
+        all_y.append(y.detach().cpu().numpy().reshape(-1))
+        all_p.append(prob.detach().cpu().numpy().reshape(-1))
 
         total_loss += float(loss.item()) * float(T * ref.size(0))
         total_frames += float(T * ref.size(0))
 
-    return {"loss": total_loss / max(1.0, total_frames)}
+    y_true = np.concatenate(all_y) if all_y else np.zeros((0,), dtype=np.float32)
+    y_prob = np.concatenate(all_p) if all_p else np.zeros((0,), dtype=np.float32)
+    ap = float("nan")
+    if _HAS_SK and y_true.size > 0 and len(np.unique(y_true)) > 1:
+        ap = float(average_precision_score(y_true, y_prob))
+
+    curves = pr_curve_by_threshold(y_true, y_prob, bins=101) if y_true.size > 0 else {}
+    fpr_thr = float("nan")
+    if curves:
+        valid = curves["fpr"] <= 0.005
+        if np.any(valid):
+            idx = int(np.argmax(curves["thr"][valid]))
+            fpr_thr = float(curves["thr"][valid][idx])
+        save_pr_curve(out_dir, epoch, curves)
+
+    return {
+        "loss": total_loss / max(1.0, total_frames),
+        "ap": ap,
+        "fpr_thr@0.005": fpr_thr,
+    }
 
 
 def train(cfg: Config) -> None:
@@ -523,14 +596,16 @@ def train(cfg: Config) -> None:
             run_loss += float(loss.item()) * float(T * ref.size(0))
             run_frames += float(T * ref.size(0))
 
-        val_m = evaluate(model, mel, val_dl, cfg, device)
+        val_m = evaluate(model, mel, val_dl, cfg, device, ep, cfg.out_dir)
         train_loss = run_loss / max(1.0, run_frames)
         scheduler.step()
 
         dt = time.time() - t0
         print(
             f"[ep {ep:03d}] train_loss={train_loss:.4f} "
-            f"val_loss={val_m['loss']:.4f} time={dt:.1f}s lr={opt.param_groups[0]['lr']:.6f}"
+            f"val_loss={val_m['loss']:.4f} ap={val_m['ap']:.4f} "
+            f"fpr_thr@0.005={val_m['fpr_thr@0.005']:.4f} "
+            f"time={dt:.1f}s lr={opt.param_groups[0]['lr']:.6f}"
         )
 
         ckpt = {
